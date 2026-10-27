@@ -4,14 +4,20 @@ import { Suspense, useEffect, useMemo, useRef } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { Environment, Lightformer, useGLTF } from "@react-three/drei";
 import {
+    AddEquation,
+    BackSide,
     Box3,
     Color,
+    CustomBlending,
     DoubleSide,
     FrontSide,
     Group,
     Material,
     Mesh,
     MeshPhysicalMaterial,
+    Object3D,
+    OneFactor,
+    OneMinusSrcAlphaFactor,
     Quaternion,
     Vector2,
     Vector3,
@@ -24,7 +30,17 @@ gsap.registerPlugin(ScrollTrigger);
 
 const MODEL_PATH = "/assets/models/newbottle1.glb";
 
-/* ---------- Replacement bottle materials + liquid slosh shader ---------- */
+// Back-wall glass pass. Can draw the GLB's inner glass surface as an extra outline.
+const ENABLE_BACK_PASS = false;
+
+// Prints every mesh name in the browser console so we can identify the inner glass wall.
+const DEBUG_MESH_NAMES = true;
+
+// Put exact mesh names here (as printed in the console) to hide them,
+// e.g. ["InnerGlass"]. Matching is case-insensitive.
+const HIDDEN_MESH_NAMES: string[] = [];
+
+/* ---------- Bottle-specific glass and amber liquid materials ---------- */
 
 type SloshUniforms = {
     uSlope: { value: Vector2 };
@@ -36,39 +52,89 @@ type SloshUniforms = {
     uGlow: { value: number };
 };
 
-// The page's smoke is rendered as DOM behind the transparent WebGL canvas.
-// Three.js transmission cannot sample that DOM layer, so use alpha-blended
-// glass with sharp environment reflections to let the real page backdrop show
-// through the bottle (rather than producing the milky rectangle seen before).
-function makeNativeBodyGlass(original: Material): Material {
-    const material = original.clone();
-    if (!(material instanceof MeshPhysicalMaterial)) return material;
+// Shared by the front and back glass passes. Filled in once the body bounds are known.
+const glassU = {
+    uBottom: { value: 0 },
+    uHeight: { value: 1 },
+};
 
-    // Use ordinary alpha blending for the DOM-backed hero background. Avoid a
-    // custom fragment-alpha shader: nested front/back glass faces were stacking
-    // into the opaque grey panel seen in the browser render.
-    material.color.set("#FFFFFF");
-    material.metalness = 0;
-    material.roughness = 0.045;
-    material.transmission = 0;
-    material.ior = 1.5;
-    material.thickness = 0.25;
-    material.attenuationColor = new Color("#FFFFFF");
-    material.attenuationDistance = 100;
-    material.clearcoat = 1;
-    material.clearcoatRoughness = 0.025;
-    material.envMapIntensity = 1.65;
-    material.opacity = 0.12;
-    material.transparent = true;
-    material.depthWrite = false;
-    material.side = FrontSide; // Avoid double blending inner and outer faces.
+// Dark amber glass: near-black base colour, soft reflections, dark tinted
+// edges and a thick base.
+function makeNativeBodyGlass(back = false): Material {
+    const material = new MeshPhysicalMaterial({
+        color: "#120600",
+        metalness: 0,
+        roughness: 0.04,
+        transmission: 0,
+        ior: 1.5,
+        clearcoat: 1,
+        clearcoatRoughness: 0.02,
+        envMapIntensity: back ? 0.15 : 2.0,
+        transparent: true,
+        opacity: 1,
+        depthWrite: false,
+        side: back ? BackSide : FrontSide,
+    });
+
+    material.blending = CustomBlending;
+    material.blendEquation = AddEquation;
+    material.blendSrc = OneFactor;
+    material.blendDst = OneMinusSrcAlphaFactor;
+
+    const previousOnBeforeCompile = material.onBeforeCompile.bind(material);
+    const previousCacheKey = material.customProgramCacheKey.bind(material);
+
+    material.onBeforeCompile = (shader, renderer) => {
+        previousOnBeforeCompile(shader, renderer);
+        shader.uniforms.uBottom = glassU.uBottom;
+        shader.uniforms.uHeight = glassU.uHeight;
+
+        shader.vertexShader = shader.vertexShader
+            .replace(
+                "#include <common>",
+                `#include <common>
+                 varying float vHY;`
+            )
+            .replace(
+                "#include <begin_vertex>",
+                `#include <begin_vertex>
+                 vHY = position.y;`
+            );
+
+        shader.fragmentShader = shader.fragmentShader
+            .replace(
+                "#include <common>",
+                `#include <common>
+                 varying float vHY;
+                 uniform float uBottom;
+                 uniform float uHeight;`
+            )
+            .replace(
+                "#include <color_fragment>",
+                `#include <color_fragment>
+                 // Use vNormal: "normal" is not declared yet at this point in the shader.
+                 float hFacing = abs(dot(normalize(vNormal), normalize(vViewPosition)));
+                 float hEdge = pow(clamp(1.0 - hFacing, 0.0, 1.0), 2.0);
+                 float hT = (vHY - uBottom) / max(uHeight, 0.001);
+                 float hBase = 1.0 - smoothstep(0.0, 0.2, hT);
+                 float hA = 0.10 + hEdge * 0.75 + hBase * 0.55;
+                 ${back ? "hA *= 0.6;" : ""}
+                 diffuseColor.a = clamp(hA, 0.0, 0.95);
+                 diffuseColor.rgb = mix(
+                     vec3(0.02, 0.01, 0.0),
+                     vec3(0.38, 0.13, 0.0),
+                     clamp(hEdge * 0.8 + hBase * 0.7, 0.0, 1.0)
+                 );`
+            );
+    };
+
+    material.customProgramCacheKey = () =>
+        `${previousCacheKey()}|hayaah-glass-v8-${back ? "back" : "front"}`;
     material.needsUpdate = true;
     return material;
 }
 
-// Vertex deformation is concentrated near the top of the liquid mesh. The
-// liquid keeps the amber colour from the new GLB, while opaque rendering avoids
-// the nested-transmission issue that can make a fill disappear behind glass.
+// Vertex deformation is concentrated near the top of the liquid mesh.
 function addLiquidSloshShader(material: Material, uniforms: SloshUniforms) {
     const previousOnBeforeCompile = material.onBeforeCompile.bind(material);
     const previousCacheKey = material.customProgramCacheKey.bind(material);
@@ -98,49 +164,72 @@ function addLiquidSloshShader(material: Material, uniforms: SloshUniforms) {
             );
     };
 
-    material.customProgramCacheKey = () => `${previousCacheKey()}|hayaah-amber-slosh-vertex-v3`;
+    material.customProgramCacheKey = () => `${previousCacheKey()}|hayaah-golden-slosh-vertex-v3`;
     material.needsUpdate = true;
 }
 
-function makeNativeLiquid(original: Material, uniforms: SloshUniforms): Material {
-    const material = original.clone();
-
-    if (material instanceof MeshPhysicalMaterial) {
-        // Let the shader provide the amber gradient; lighting and clearcoat
-        // still supply shape and highlights without the GLB transmission washing
-        // the colour toward cream in the transparent WebGL canvas.
-        // Set the amber directly on the material; do not rely on a fragment
-        // color override that can be brittle across Three.js shader revisions.
-        material.color.set("#FF7908");
-        material.metalness = 0;
-        material.roughness = 0.12;
-        material.transmission = 0;
-        material.ior = 1.36;
-        material.thickness = 0.45;
-        material.attenuationColor = new Color("#A65312");
-        material.attenuationDistance = 1.2;
-        material.clearcoat = 0.9;
-        material.clearcoatRoughness = 0.035;
-        material.envMapIntensity = 0.9;
-        material.emissive = new Color("#8B2700");
-        material.emissiveIntensity = 0.22;
-        material.opacity = 1;
-        material.transparent = false;
-        material.depthWrite = true;
-        material.side = DoubleSide;
-    }
+// Deep golden amber. Richer/darker: #B86A08. Brighter/more golden: #DC9A1A.
+function makeNativeLiquid(uniforms: SloshUniforms): Material {
+    const material = new MeshPhysicalMaterial({
+        color: "#CC7F0C",
+        metalness: 0,
+        roughness: 0.18,
+        transmission: 0,
+        ior: 1.36,
+        thickness: 0.2,
+        clearcoat: 0.48,
+        clearcoatRoughness: 0.055,
+        envMapIntensity: 0.45,
+        emissive: new Color("#7A4300"),
+        emissiveIntensity: 0.3,
+        opacity: 1,
+        transparent: false,
+        depthWrite: true,
+        side: DoubleSide,
+    });
 
     addLiquidSloshShader(material, uniforms);
     return material;
 }
 
-// The new model already has the desired gold cap, gold collar, and gold logo.
-// Preserve those exported materials and only tune the two parts that need it.
+function isGlassMesh(meshName: string, original: Material): boolean {
+    if (meshName.includes("liquid")) return false;
+    if (meshName.includes("body") || meshName.includes("glass") || meshName.includes("inner")) {
+        return true;
+    }
+    return original instanceof MeshPhysicalMaterial && original.transmission > 0.5;
+}
+
+function makeGoldCap(): Material {
+    return new MeshPhysicalMaterial({
+        color: "#D4AF37",
+        metalness: 0.92,
+        roughness: 0.2,
+        clearcoat: 0.8,
+        clearcoatRoughness: 0.12,
+        envMapIntensity: 2.2,
+    });
+}
+
+function isCapMesh(meshName: string): boolean {
+    return ["cap", "lid", "closure", "collar"].some((part) =>
+        meshName.includes(part)
+    );
+}
+
+// Keep the exported gold cap / collar / logo materials, only boost cap reflections.
 function pickMaterial(meshName: string, original: Material, uniforms: SloshUniforms): Material {
     const name = meshName.toLowerCase();
-    if (name.includes("liquid")) return makeNativeLiquid(original, uniforms);
-    if (name.includes("body")) return makeNativeBodyGlass(original);
-    return original.clone();
+    if (isCapMesh(name)) return makeGoldCap();
+    if (name.includes("liquid")) return makeNativeLiquid(uniforms);
+    if (isGlassMesh(name, original)) return makeNativeBodyGlass(false);
+
+    const m = original.clone();
+    if (m instanceof MeshPhysicalMaterial) {
+        m.envMapIntensity = 1.8;
+        m.clearcoat = Math.max(m.clearcoat, 0.6);
+    }
+    return m;
 }
 
 /* ---------- Bottle ---------- */
@@ -186,12 +275,22 @@ function HayaahBottle() {
     const model = useMemo(() => {
         const clonedScene = scene.clone(true);
         const found: { liquid: Mesh | null } = { liquid: null };
+        const backPasses: { mesh: Mesh; parent: Object3D }[] = [];
+        let tallestGlass = 0;
 
         clonedScene.traverse((object) => {
-
             if (!(object instanceof Mesh)) return;
 
             const meshName = object.name.toLowerCase();
+
+            if (DEBUG_MESH_NAMES) {
+                console.log("[hayaah] mesh:", object.name);
+            }
+
+            if (HIDDEN_MESH_NAMES.some((n) => n.toLowerCase() === meshName)) {
+                object.visible = false;
+                return;
+            }
 
             if (meshName.includes("liquid")) {
                 object.geometry.computeBoundingBox();
@@ -200,7 +299,6 @@ function HayaahBottle() {
                     const liquidHeight = Math.max(bounds.max.y - bounds.min.y, 0.001);
                     sloshU.uTop.value = bounds.max.y;
                     sloshU.uBottom.value = bounds.min.y;
-                    // Limit deformation to the upper part of the liquid mesh.
                     sloshU.uBand.value = Math.max(liquidHeight * 0.32, 0.001);
                 }
                 found.liquid = object;
@@ -210,6 +308,8 @@ function HayaahBottle() {
                 ? object.material
                 : [object.material];
 
+            const glass = isGlassMesh(meshName, originals[0]);
+
             const replaced = originals.map((orig: Material) =>
                 pickMaterial(meshName, orig, sloshU)
             );
@@ -217,7 +317,34 @@ function HayaahBottle() {
             object.material = Array.isArray(object.material)
                 ? replaced
                 : replaced[0];
+
+            if (glass) {
+                object.geometry.computeBoundingBox();
+                const b = object.geometry.boundingBox;
+                if (b) {
+                    const h = Math.max(b.max.y - b.min.y, 0.001);
+                    // Use the tallest glass mesh (the outer wall) for the thick-base effect.
+                    if (h > tallestGlass) {
+                        tallestGlass = h;
+                        glassU.uBottom.value = b.min.y;
+                        glassU.uHeight.value = h;
+                    }
+                }
+                object.renderOrder = 2;
+
+                if (ENABLE_BACK_PASS) {
+                    const backMesh = new Mesh(object.geometry, makeNativeBodyGlass(true));
+                    backMesh.renderOrder = 1;
+                    backMesh.position.copy(object.position);
+                    backMesh.quaternion.copy(object.quaternion);
+                    backMesh.scale.copy(object.scale);
+                    if (object.parent) backPasses.push({ mesh: backMesh, parent: object.parent });
+                }
+            }
         });
+
+        // Added after traversal so the traversal does not visit the new meshes.
+        backPasses.forEach(({ mesh, parent }) => parent.add(mesh));
 
         clonedScene.updateMatrixWorld(true);
 
@@ -239,8 +366,6 @@ function HayaahBottle() {
         liquidRef.current = model.liquid;
     }, [model]);
 
-    // Drive the liquid surface from the same live transforms GSAP applies to the
-    // bottle. Acceleration kicks the liquid; a damped spring then settles it.
     useFrame((frame, delta) => {
         const dt = Math.min(delta, 1 / 30);
         const bottle = bottleRef.current;
@@ -248,8 +373,6 @@ function HayaahBottle() {
         const liquid = liquidRef.current;
         if (!bottle || !tilt || !liquid || dt <= 0) return;
 
-        // Keep the second file's subtle pointer-driven bottle tilt, nested inside
-        // the existing GSAP scroll transform so neither animation overwrites the other.
         const pointerEase = 1 - Math.exp(-dt * 4);
         tilt.rotation.x += (-frame.pointer.y * 0.11 - tilt.rotation.x) * pointerEase;
         tilt.rotation.z += (-frame.pointer.x * 0.09 - tilt.rotation.z) * pointerEase;
@@ -275,8 +398,6 @@ function HayaahBottle() {
             state.ready = true;
         }
 
-        // Convert the liquid mesh's world movement into its local axes. Changes
-        // in that velocity act like inertia when scroll animation speeds up/slows down.
         temp.liquidVelocity
             .copy(temp.liquidWorldPosition)
             .sub(state.previousPosition)
@@ -295,7 +416,6 @@ function HayaahBottle() {
         const spin = Math.abs((bottle.rotation.y - state.previousRotationY) / dt);
         state.previousRotationY = bottle.rotation.y;
 
-        // Damped spring: follows the gravity-level surface, but overshoots slightly.
         const stiffness = 36;
         const damping = 3.0;
         state.velocity.x += (-stiffness * (state.slope.x - targetX) - damping * state.velocity.x) * dt;
@@ -303,7 +423,6 @@ function HayaahBottle() {
         state.slope.x = Math.max(-0.5, Math.min(0.5, state.slope.x + state.velocity.x * dt));
         state.slope.y = Math.max(-0.5, Math.min(0.5, state.slope.y + state.velocity.y * dt));
 
-        // Keep motion subtle at rest and stronger while the bottle is moving.
         const speed = Math.hypot(state.velocity.x, state.velocity.y);
         const rippleTarget = 0.012 + Math.min(0.085, speed * 0.04 + spin * 0.035);
         sloshU.uRipple.value += (rippleTarget - sloshU.uRipple.value) * (1 - Math.exp(-dt * 5));
@@ -426,35 +545,17 @@ function Scene() {
                 <HayaahBottle />
 
                 <Environment resolution={512} background={false}>
-                    {/* Broad frontal softbox: gives the clear grey glass something to reflect. */}
+                    {/* Broad, soft frontal light: no thin streaks */}
                     <Lightformer
                         form="rect"
-                        intensity={0.28}
+                        intensity={0.35}
                         color="#D5D3CE"
                         position={[0, 0.5, 5]}
-                        scale={[1.5, 2.4, 1]}
+                        scale={[3, 5, 1]}
                         onUpdate={(light) => light.lookAt(0, 0, 0)}
                     />
 
-                    {/* Narrow side strips create crisp glass-edge reflections. */}
-                    <Lightformer
-                        form="rect"
-                        intensity={3.0}
-                        color="#FFFFFF"
-                        position={[-3.2, 0.7, 2.5]}
-                        scale={[0.3, 7, 1]}
-                        onUpdate={(light) => light.lookAt(0, 0, 0)}
-                    />
-                    <Lightformer
-                        form="rect"
-                        intensity={3.0}
-                        color="#FFFFFF"
-                        position={[3.2, 0.7, 2.5]}
-                        scale={[0.3, 7, 1]}
-                        onUpdate={(light) => light.lookAt(0, 0, 0)}
-                    />
-
-                    {/* Horizontal top reflection across the shoulder and cap. */}
+                    {/* Horizontal top reflection across the shoulder and cap */}
                     <Lightformer
                         form="rect"
                         intensity={1.1}
@@ -464,9 +565,7 @@ function Scene() {
                         onUpdate={(light) => light.lookAt(0, 0, 0)}
                     />
 
-                    {/* Lower reflection card removed to prevent the grey band at the bottle base. */}
-
-                    {/* Warm rear rim: subtle gold reflections without flooding the front. */}
+                    {/* Rear rim */}
                     <Lightformer
                         form="rect"
                         intensity={0.25}
@@ -476,7 +575,7 @@ function Scene() {
                         onUpdate={(light) => light.lookAt(0, 0, 0)}
                     />
 
-                    {/* Overhead softbox catches the cap's top bevels. */}
+                    {/* Overhead softbox catches the cap's top bevels */}
                     <Lightformer
                         form="rect"
                         intensity={1.8}
@@ -500,7 +599,7 @@ export default function PerfumeExperience() {
                 <Canvas
                     camera={{ position: [0, 1.55, 6.5], fov: 35 }}
                     dpr={[1, 1.5]}
-                    gl={{ antialias: true, alpha: true }}
+                    gl={{ antialias: true, alpha: true, toneMappingExposure: 1.1 }}
                 >
                     <Scene />
                 </Canvas>
@@ -562,85 +661,26 @@ export default function PerfumeExperience() {
 
                     {/* 8 Core Pillars */}
                     <div className="pillars-grid">
-                        <div className="pillar-item">
-                            <div className="pillar-icon-box">
-                                <span className="pillar-sparkle">&#10022;</span>
+                        {[
+                            ["Premium Quality", "Meticulously sourced raw essences and ultra-refined natural aroma compounds."],
+                            ["Long Lasting Performance", "Engineered for high tenacity, keeping your signature scent vibrant from dawn to midnight."],
+                            ["High Projection & Sillage", "A magnetic aura that leaves a memorable, captivating trail wherever you enter."],
+                            ["Smooth & Luxurious Finish", "Seamless olfactory evolution without harshness — smooth, velvety drydowns."],
+                            ["Elegant Packaging", "Heavy crystal flacons crowned with artisanal bevels, designed as a vanity centerpiece."],
+                            ["Affordable Luxury", "Haute perfumerie grade compositions accessible directly from our atelier to you."],
+                            ["Made in India", "Formulated with pride in Trivandrum, Kerala — honoring Indian botanicals & heritage."],
+                            ["Trusted by Customers", "Loved, gifted, and endorsed by thousands of discerning fragrance connoisseurs."],
+                        ].map(([title, text]) => (
+                            <div className="pillar-item" key={title}>
+                                <div className="pillar-icon-box">
+                                    <span className="pillar-sparkle">&#10022;</span>
+                                </div>
+                                <div className="pillar-text">
+                                    <h4>{title}</h4>
+                                    <p>{text}</p>
+                                </div>
                             </div>
-                            <div className="pillar-text">
-                                <h4>Premium Quality</h4>
-                                <p>Meticulously sourced raw essences and ultra-refined natural aroma compounds.</p>
-                            </div>
-                        </div>
-
-                        <div className="pillar-item">
-                            <div className="pillar-icon-box">
-                                <span className="pillar-sparkle">&#10022;</span>
-                            </div>
-                            <div className="pillar-text">
-                                <h4>Long Lasting Performance</h4>
-                                <p>Engineered for high tenacity, keeping your signature scent vibrant from dawn to midnight.</p>
-                            </div>
-                        </div>
-
-                        <div className="pillar-item">
-                            <div className="pillar-icon-box">
-                                <span className="pillar-sparkle">&#10022;</span>
-                            </div>
-                            <div className="pillar-text">
-                                <h4>High Projection &amp; Sillage</h4>
-                                <p>A magnetic aura that leaves a memorable, captivating trail wherever you enter.</p>
-                            </div>
-                        </div>
-
-                        <div className="pillar-item">
-                            <div className="pillar-icon-box">
-                                <span className="pillar-sparkle">&#10022;</span>
-                            </div>
-                            <div className="pillar-text">
-                                <h4>Smooth &amp; Luxurious Finish</h4>
-                                <p>Seamless olfactory evolution without harshness — smooth, velvety drydowns.</p>
-                            </div>
-                        </div>
-
-                        <div className="pillar-item">
-                            <div className="pillar-icon-box">
-                                <span className="pillar-sparkle">&#10022;</span>
-                            </div>
-                            <div className="pillar-text">
-                                <h4>Elegant Packaging</h4>
-                                <p>Heavy crystal flacons crowned with artisanal bevels, designed as a vanity centerpiece.</p>
-                            </div>
-                        </div>
-
-                        <div className="pillar-item">
-                            <div className="pillar-icon-box">
-                                <span className="pillar-sparkle">&#10022;</span>
-                            </div>
-                            <div className="pillar-text">
-                                <h4>Affordable Luxury</h4>
-                                <p>Haute perfumerie grade compositions accessible directly from our atelier to you.</p>
-                            </div>
-                        </div>
-
-                        <div className="pillar-item">
-                            <div className="pillar-icon-box">
-                                <span className="pillar-sparkle">&#10022;</span>
-                            </div>
-                            <div className="pillar-text">
-                                <h4>Made in India</h4>
-                                <p>Formulated with pride in Trivandrum, Kerala — honoring Indian botanicals &amp; heritage.</p>
-                            </div>
-                        </div>
-
-                        <div className="pillar-item">
-                            <div className="pillar-icon-box">
-                                <span className="pillar-sparkle">&#10022;</span>
-                            </div>
-                            <div className="pillar-text">
-                                <h4>Trusted by Customers</h4>
-                                <p>Loved, gifted, and endorsed by thousands of discerning fragrance connoisseurs.</p>
-                            </div>
-                        </div>
+                        ))}
                     </div>
 
                     {/* Brand Values Ribbon */}
