@@ -112,12 +112,12 @@ const makeChampagneGold = () =>
 
 const makeLogo = () =>
     new MeshStandardMaterial({
-        color: ANTIQUE_GOLD,
-        metalness: 0.85,
-        roughness: 0.24,
-        emissive: new Color("#281B0A"),
-        emissiveIntensity: 0.12,
-        envMapIntensity: 0.55,
+        color: "#E1C58F",
+        metalness: 0.92,
+        roughness: 0.15,
+        emissive: new Color("#5A3E1B"),
+        emissiveIntensity: 0.38,
+        envMapIntensity: 1.4,
     });
 
 function pickMaterial(meshName: string, original: Material): Material | null {
@@ -216,94 +216,72 @@ function HayaahBottle() {
     useEffect(() => {
         const group = bottleRef.current;
         const track = document.querySelector("#hayaah-track");
+        const introSection = document.querySelector("#why-hayaah");
 
         if (!group || !track) return;
 
         const mobile = window.matchMedia("(max-width: 768px)").matches;
 
         const context = gsap.context(() => {
-            gsap.set(group.position, { x: mobile ? 0 : 0.85, y: -0.12, z: 0 });
-            const positionTimeline = gsap.timeline({
-                scrollTrigger: {
-                    trigger: track,
-                    start: "top top",
-                    end: "bottom bottom",
-                    scrub: 0.6,
-                    invalidateOnRefresh: true,
-                },
-            });
-            // Move gently down and inward during the reveal, then settle back to
-            // the established end position so the section transition feels intentional.
-            positionTimeline
-                .to(group.position, {
-                    x: mobile ? -0.08 : 0.48,
-                    y: -0.28,
-                    z: 0,
-                    duration: 0.48,
-                    ease: "none",
-                })
-                .to(group.position, {
-                    x: mobile ? 0 : 0.85,
+            gsap.set(group.position, { x: mobile ? 0 : 0.32, y: -0.18, z: 0 });
+            gsap.set(group.rotation, { x: 0, y: 0, z: 0 });
+            gsap.set(group.scale, { x: 0.84, y: 0.84, z: 0.84 });
+
+            if (introSection) {
+                const positionTimeline = gsap.timeline({
+                    scrollTrigger: {
+                        trigger: introSection,
+                        start: "top bottom",
+                        end: "top 25%",
+                        scrub: 0.8,
+                        invalidateOnRefresh: true,
+                    },
+                });
+                positionTimeline.to(group.position, {
+                    x: mobile ? 0 : 0.72,
                     y: -0.12,
                     z: 0,
-                    duration: 0.52,
-                    ease: "none",
+                    ease: "power1.inOut",
                 });
 
-            // Ensure the bottle is perfectly front-facing at load. During the
-            // scroll it turns only slightly, then returns to zero rotation at the end.
-            gsap.set(group.rotation, { x: 0, y: 0, z: 0 });
-            const rotationTimeline = gsap.timeline({
-                scrollTrigger: {
-                    trigger: track,
-                    start: "top top",
-                    end: "bottom bottom",
-                    scrub: 0.6,
-                    invalidateOnRefresh: true,
-                },
-            });
-            // A more noticeable but controlled product reveal:
-            // start front-facing, turn slightly during the middle of the scroll,
-            // then return exactly to the same front-facing orientation at the end.
-            rotationTimeline
-                .to(group.rotation, {
-                    x: 0.035,
-                    y: 0.2,
-                    z: -0.018,
-                    duration: 0.34,
-                    ease: "none",
-                })
-                .to(group.rotation, {
-                    x: -0.018,
-                    y: -0.11,
-                    z: 0.012,
-                    duration: 0.28,
-                    ease: "none",
-                })
-                .to(group.rotation, {
-                    x: 0,
-                    y: 0,
-                    z: 0,
-                    duration: 0.38,
-                    ease: "none",
-                });
-
-            gsap.fromTo(
-                group.scale,
-                { x: 0.84, y: 0.84, z: 0.84 },
-                {
-                    x: mobile ? 0.58 : 0.68,
-                    y: mobile ? 0.58 : 0.68,
-                    z: mobile ? 0.58 : 0.68,
-                    ease: "none",
+                const rotationTimeline = gsap.timeline({
                     scrollTrigger: {
-                        trigger: track,
-                        start: "top top",
-                        end: "55% bottom",
-                        scrub: 0.6,
+                        trigger: introSection,
+                        start: "top bottom",
+                        end: "top 25%",
+                        scrub: 0.8,
+                        invalidateOnRefresh: true,
                     },
-                }
-            );
+                });
+                rotationTimeline
+                    .to(group.rotation, {
+                        x: 0.02,
+                        y: 0.15,
+                        z: -0.01,
+                        duration: 0.5,
+                        ease: "none",
+                    })
+                    .to(group.rotation, {
+                        x: 0,
+                        y: 0,
+                        z: 0,
+                        duration: 0.5,
+                        ease: "none",
+                    });
+
+                gsap.to(group.scale, {
+                    x: mobile ? 0.6 : 0.72,
+                    y: mobile ? 0.6 : 0.72,
+                    z: mobile ? 0.6 : 0.72,
+                    ease: "power1.inOut",
+                    scrollTrigger: {
+                        trigger: introSection,
+                        start: "top bottom",
+                        end: "top 25%",
+                        scrub: 0.8,
+                    },
+                });
+            }
         }, track);
 
         return () => context.revert();
@@ -333,7 +311,7 @@ function HayaahBottle() {
     }, [model]);
 
     return (
-        <group ref={bottleRef} position={[0.85, -0.12, 0]} rotation={[0, 0, 0]}>
+        <group ref={bottleRef} position={[0.32, -0.18, 0]} rotation={[0, 0, 0]}>
             <group scale={model.scale} position={model.center.toArray()}>
                 <primitive object={model.scene} />
             </group>
@@ -427,9 +405,6 @@ function Scene() {
 export default function PerfumeExperience() {
     return (
         <div id="hayaah-track" className="hayaah-track">
-            {/* Live transparent WebGL smoke sits behind the GLB bottle. */}
-            <HayaahSmokeOverlay />
-
             <div className="scene-sticky">
                 <Canvas
                     camera={{ position: [0, 1.55, 6.5], fov: 35 }}
@@ -441,45 +416,166 @@ export default function PerfumeExperience() {
             </div>
 
             <section className="hayaah-hero">
+                <div className="hero-backdrop" aria-hidden="true" />
+                {/* Absolute overlay scrolls away with the first hero; never sticky/fixed. */}
+                <HayaahSmokeOverlay />
                 <div className="hero-content-sticky">
-                    <div className="hero-nav">
-                        <span>HAYAAH</span>
-                        <span>EAU DE PARFUM</span>
-                    </div>
-
                     <div className="hero-copy">
                         <p className="hero-eyebrow">THE ART OF FRAGRANCE</p>
-                        <h1>
-                            A SCENT
-                            <br />
-                            THAT <span>STAYS.</span>
+                        <h1 className="hero-headline">
+                            A SCENT<br />
+                            THAT<br />
+                            <span className="hero-gold-italic">STAYS.</span>
                         </h1>
                         <p className="hero-description">
-                            Discover a fragrance crafted to leave a lasting impression.
+                            Discover a fragrance crafted from rare ingredients to leave a lasting impression.
                         </p>
+                        <div className="hero-actions">
+                            <a href="#collections" className="hero-explore-cta">
+                                <span className="cta-text">EXPLORE COLLECTION</span>
+                                <span className="cta-circle">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="cta-arrow" aria-hidden="true">
+                                        <path d="M5 12h14M13 6l6 6-6 6" />
+                                    </svg>
+                                </span>
+                            </a>
+                        </div>
                     </div>
 
-                    <div className="hero-product-label">
-                        <span>HAYAAH</span>
-                        <span>EXTRAIT DE PARFUM</span>
+                    <div className="hero-scroll-indicator">
+                        <div className="scroll-vertical-line" />
+                        <div className="scroll-marker">
+                            <span className="scroll-circle" />
+                            <span className="scroll-label">SCROLL</span>
+                        </div>
                     </div>
-
-                    <div className="scroll-indicator">SCROLL TO DISCOVER ↓</div>
                 </div>
             </section>
 
-            <section className="fragrance-intro">
+            <section id="why-hayaah" className="fragrance-intro">
                 <div className="intro-content">
-                    <p>BEYOND THE ORDINARY</p>
+                    <div className="intro-badge-row">
+                        <span className="intro-arabic">حَيَاء</span>
+                        <p className="intro-kicker">WHY CHOOSE HAYAAH &bull; OUR PROMISE</p>
+                    </div>
+
                     <h2>
-                        An essence
+                        An essence of
                         <br />
-                        of <em>elegance.</em>
+                        <em>timeless sophistication.</em>
                     </h2>
-                    <p>
-                        Deep, distinctive and unforgettable. Experience fragrance
-                        through a different lens.
+
+                    <p className="intro-lead">
+                        Born in Trivandrum, crafted for those who command distinction. We blend the world&apos;s rarest perfumery oils with uncompromising craftsmanship to redefine luxury fragrance in India.
                     </p>
+
+                    {/* 8 Core Pillars */}
+                    <div className="pillars-grid">
+                        <div className="pillar-item">
+                            <div className="pillar-icon-box">
+                                <span className="pillar-sparkle">&#10022;</span>
+                            </div>
+                            <div className="pillar-text">
+                                <h4>Premium Quality</h4>
+                                <p>Meticulously sourced raw essences and ultra-refined natural aroma compounds.</p>
+                            </div>
+                        </div>
+
+                        <div className="pillar-item">
+                            <div className="pillar-icon-box">
+                                <span className="pillar-sparkle">&#10022;</span>
+                            </div>
+                            <div className="pillar-text">
+                                <h4>Long Lasting Performance</h4>
+                                <p>Engineered for high tenacity, keeping your signature scent vibrant from dawn to midnight.</p>
+                            </div>
+                        </div>
+
+                        <div className="pillar-item">
+                            <div className="pillar-icon-box">
+                                <span className="pillar-sparkle">&#10022;</span>
+                            </div>
+                            <div className="pillar-text">
+                                <h4>High Projection &amp; Sillage</h4>
+                                <p>A magnetic aura that leaves a memorable, captivating trail wherever you enter.</p>
+                            </div>
+                        </div>
+
+                        <div className="pillar-item">
+                            <div className="pillar-icon-box">
+                                <span className="pillar-sparkle">&#10022;</span>
+                            </div>
+                            <div className="pillar-text">
+                                <h4>Smooth &amp; Luxurious Finish</h4>
+                                <p>Seamless olfactory evolution without harshness — smooth, velvety drydowns.</p>
+                            </div>
+                        </div>
+
+                        <div className="pillar-item">
+                            <div className="pillar-icon-box">
+                                <span className="pillar-sparkle">&#10022;</span>
+                            </div>
+                            <div className="pillar-text">
+                                <h4>Elegant Packaging</h4>
+                                <p>Heavy crystal flacons crowned with artisanal bevels, designed as a vanity centerpiece.</p>
+                            </div>
+                        </div>
+
+                        <div className="pillar-item">
+                            <div className="pillar-icon-box">
+                                <span className="pillar-sparkle">&#10022;</span>
+                            </div>
+                            <div className="pillar-text">
+                                <h4>Affordable Luxury</h4>
+                                <p>Haute perfumerie grade compositions accessible directly from our atelier to you.</p>
+                            </div>
+                        </div>
+
+                        <div className="pillar-item">
+                            <div className="pillar-icon-box">
+                                <span className="pillar-sparkle">&#10022;</span>
+                            </div>
+                            <div className="pillar-text">
+                                <h4>Made in India</h4>
+                                <p>Formulated with pride in Trivandrum, Kerala — honoring Indian botanicals &amp; heritage.</p>
+                            </div>
+                        </div>
+
+                        <div className="pillar-item">
+                            <div className="pillar-icon-box">
+                                <span className="pillar-sparkle">&#10022;</span>
+                            </div>
+                            <div className="pillar-text">
+                                <h4>Trusted by Customers</h4>
+                                <p>Loved, gifted, and endorsed by thousands of discerning fragrance connoisseurs.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Brand Values Ribbon */}
+                    <div className="brand-values-ribbon">
+                        <span className="values-label">BRAND VALUES:</span>
+                        <div className="values-tags">
+                            <span>Luxury</span>
+                            <span>Quality</span>
+                            <span>Innovation</span>
+                            <span>Trust</span>
+                            <span>Elegance</span>
+                            <span>Customer Satisfaction</span>
+                            <span>Sustainability</span>
+                            <span>Authenticity</span>
+                        </div>
+                    </div>
+
+                    <div className="intro-action-row">
+                        <a href="#collections" className="intro-link">
+                            <span>EXPLORE SIGNATURE COLLECTIONS</span>
+                            <span className="link-arrow">&rarr;</span>
+                        </a>
+                        <a href="#contact" className="b2b-link">
+                            <span>Wholesale &bull; Become a Dealer &bull; Franchise Enquiry &rarr;</span>
+                        </a>
+                    </div>
                 </div>
             </section>
         </div>

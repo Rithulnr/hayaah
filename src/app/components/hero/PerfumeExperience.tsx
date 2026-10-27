@@ -1,19 +1,19 @@
 "use client";
 
 import { Suspense, useEffect, useMemo, useRef } from "react";
-import { Canvas } from "@react-three/fiber";
+import { Canvas, useFrame } from "@react-three/fiber";
 import { Environment, Lightformer, useGLTF } from "@react-three/drei";
 import {
     Box3,
     Color,
-    EdgesGeometry,
+    DoubleSide,
+    FrontSide,
     Group,
-    LineBasicMaterial,
-    LineSegments,
     Material,
     Mesh,
     MeshPhysicalMaterial,
-    MeshStandardMaterial,
+    Quaternion,
+    Vector2,
     Vector3,
 } from "three";
 import gsap from "gsap";
@@ -22,120 +22,125 @@ import HayaahSmokeOverlay from "./HayaahSmokeOverlay";
 
 gsap.registerPlugin(ScrollTrigger);
 
-const MODEL_PATH = "/assets/models/glass.glb";
+const MODEL_PATH = "/assets/models/newbottle1.glb";
 
-/* ---------- Palette ---------- */
+/* ---------- Replacement bottle materials + liquid slosh shader ---------- */
 
-const ANTIQUE_GOLD = "#C5A46D";
-const CHAMPAGNE_GOLD = "#E1C58F";
+type SloshUniforms = {
+    uSlope: { value: Vector2 };
+    uTop: { value: number };
+    uBottom: { value: number };
+    uBand: { value: number };
+    uRipple: { value: number };
+    uTime: { value: number };
+    uGlow: { value: number };
+};
 
-/* ---------- Material tuning ---------- */
-
-// Important: keep the GLB's own physical glass material and its light base
-// colour. We only add the missing smoky attenuation that Blender's Volume
-// Absorption did not export to glTF.
+// The page's smoke is rendered as DOM behind the transparent WebGL canvas.
+// Three.js transmission cannot sample that DOM layer, so use alpha-blended
+// glass with sharp environment reflections to let the real page backdrop show
+// through the bottle (rather than producing the milky rectangle seen before).
 function makeNativeBodyGlass(original: Material): Material {
     const material = original.clone();
     if (!(material instanceof MeshPhysicalMaterial)) return material;
 
-    material.color.set("#B8B8B8");
+    // Use ordinary alpha blending for the DOM-backed hero background. Avoid a
+    // custom fragment-alpha shader: nested front/back glass faces were stacking
+    // into the opaque grey panel seen in the browser render.
+    material.color.set("#FFFFFF");
     material.metalness = 0;
-    material.roughness = 0.02;
-    material.transmission = 1.0;
-    material.ior = 1.52;
-    material.thickness = 0.75;
-    material.attenuationColor = new Color("#303030");
-    material.attenuationDistance = 1.15;
-    material.clearcoat = 0.22;
-    material.clearcoatRoughness = 0.2;
-    material.envMapIntensity = 0.42;
-    material.opacity = 1;
-    material.transparent = false;
-    material.needsUpdate = true;
-    return material;
-}
-
-// Keep the GLB liquid material; do not replace it with a black generated map.
-// Slightly darker attenuation gives the centre a smoky fill. It stays in the
-// transparent render list so it can blend naturally with the body/environment.
-function makeNativeLiquid(original: Material): Material {
-    const material = original.clone();
-    if (!(material instanceof MeshPhysicalMaterial)) return material;
-
-    material.color.set("#DEDEDE");
-    material.metalness = 0;
-    material.roughness = 0.025;
-    material.transmission = 0.82;
-    material.ior = 1.33;
-    material.thickness = 0.45;
-    material.attenuationColor = new Color("#262626");
-    material.attenuationDistance = 0.72;
-    material.clearcoat = 0.12;
-    material.clearcoatRoughness = 0.2;
-    material.envMapIntensity = 0.08;
-    material.opacity = 1;
+    material.roughness = 0.045;
+    material.transmission = 0;
+    material.ior = 1.5;
+    material.thickness = 0.25;
+    material.attenuationColor = new Color("#FFFFFF");
+    material.attenuationDistance = 100;
+    material.clearcoat = 1;
+    material.clearcoatRoughness = 0.025;
+    material.envMapIntensity = 1.65;
+    material.opacity = 0.12;
     material.transparent = true;
     material.depthWrite = false;
+    material.side = FrontSide; // Avoid double blending inner and outer faces.
     material.needsUpdate = true;
     return material;
 }
 
-const makeBlackCap = () =>
-    new MeshPhysicalMaterial({
-        color: "#050505",
-        metalness: 0.04,
-        roughness: 0.12,
-        transmission: 0,
-        opacity: 1,
-        transparent: false,
-        ior: 1.5,
-        clearcoat: 1,
-        clearcoatRoughness: 0.06,
-        envMapIntensity: 1.6,
-    });
+// Vertex deformation is concentrated near the top of the liquid mesh. The
+// liquid keeps the amber colour from the new GLB, while opaque rendering avoids
+// the nested-transmission issue that can make a fill disappear behind glass.
+function addLiquidSloshShader(material: Material, uniforms: SloshUniforms) {
+    const previousOnBeforeCompile = material.onBeforeCompile.bind(material);
+    const previousCacheKey = material.customProgramCacheKey.bind(material);
 
-const makeAntiqueGold = () =>
-    new MeshStandardMaterial({
-        color: ANTIQUE_GOLD,
-        metalness: 1,
-        roughness: 0.18,
-        envMapIntensity: 1.8,
-    });
+    material.onBeforeCompile = (shader, renderer) => {
+        previousOnBeforeCompile(shader, renderer);
+        Object.assign(shader.uniforms, uniforms);
 
-const makeChampagneGold = () =>
-    new MeshStandardMaterial({
-        color: CHAMPAGNE_GOLD,
-        metalness: 1,
-        roughness: 0.16,
-        envMapIntensity: 1.5,
-    });
+        shader.vertexShader = shader.vertexShader
+            .replace(
+                "#include <common>",
+                `#include <common>
+                 uniform vec2 uSlope;
+                 uniform float uTop;
+                 uniform float uBand;
+                 uniform float uRipple;
+                 uniform float uTime;`
+            )
+            .replace(
+                "#include <begin_vertex>",
+                `vec3 transformed = vec3( position );
+                 float hh = clamp((position.y - (uTop - uBand)) / max(uBand, 0.001), 0.0, 1.0);
+                 float ww = hh * hh * (3.0 - 2.0 * hh);
+                 float wave = sin(position.x * 4.0 + uTime * 2.3) * 0.5
+                            + sin(position.z * 5.0 - uTime * 1.9) * 0.5;
+                 transformed.y += ww * (uSlope.x * position.x + uSlope.y * position.z + wave * uRipple);`
+            );
+    };
 
-const makeLogo = () =>
-    new MeshStandardMaterial({
-        color: "#E1C58F",
-        metalness: 0.92,
-        roughness: 0.15,
-        emissive: new Color("#5A3E1B"),
-        emissiveIntensity: 0.38,
-        envMapIntensity: 1.4,
-    });
+    material.customProgramCacheKey = () => `${previousCacheKey()}|hayaah-amber-slosh-vertex-v3`;
+    material.needsUpdate = true;
+}
 
-function pickMaterial(meshName: string, original: Material): Material | null {
-    const name = meshName.toLowerCase();
-    const materialName = original.name.toLowerCase();
+function makeNativeLiquid(original: Material, uniforms: SloshUniforms): Material {
+    const material = original.clone();
 
-    // The uploaded GLB uses HAYAAH_Cap as its node name; support older exports too.
-    if (name.includes("cap")) return makeBlackCap();
-    if (name.includes("logo") || name === "text") return makeLogo();
-    if (name.includes("goldedges")) return makeChampagneGold();
-    if (name.includes("collar") || materialName.includes("gold")) {
-        return makeAntiqueGold();
+    if (material instanceof MeshPhysicalMaterial) {
+        // Let the shader provide the amber gradient; lighting and clearcoat
+        // still supply shape and highlights without the GLB transmission washing
+        // the colour toward cream in the transparent WebGL canvas.
+        // Set the amber directly on the material; do not rely on a fragment
+        // color override that can be brittle across Three.js shader revisions.
+        material.color.set("#FF7908");
+        material.metalness = 0;
+        material.roughness = 0.12;
+        material.transmission = 0;
+        material.ior = 1.36;
+        material.thickness = 0.45;
+        material.attenuationColor = new Color("#A65312");
+        material.attenuationDistance = 1.2;
+        material.clearcoat = 0.9;
+        material.clearcoatRoughness = 0.035;
+        material.envMapIntensity = 0.9;
+        material.emissive = new Color("#8B2700");
+        material.emissiveIntensity = 0.22;
+        material.opacity = 1;
+        material.transparent = false;
+        material.depthWrite = true;
+        material.side = DoubleSide;
     }
-    if (name === "hayaah_body") return makeNativeBodyGlass(original);
-    if (name === "hayaah_liquid") return makeNativeLiquid(original);
 
-    // Keep the rest of the GLB materials as exported.
-    return null;
+    addLiquidSloshShader(material, uniforms);
+    return material;
+}
+
+// The new model already has the desired gold cap, gold collar, and gold logo.
+// Preserve those exported materials and only tune the two parts that need it.
+function pickMaterial(meshName: string, original: Material, uniforms: SloshUniforms): Material {
+    const name = meshName.toLowerCase();
+    if (name.includes("liquid")) return makeNativeLiquid(original, uniforms);
+    if (name.includes("body")) return makeNativeBodyGlass(original);
+    return original.clone();
 }
 
 /* ---------- Bottle ---------- */
@@ -143,59 +148,75 @@ function pickMaterial(meshName: string, original: Material): Material | null {
 function HayaahBottle() {
     const { scene } = useGLTF(MODEL_PATH);
     const bottleRef = useRef<Group>(null);
+    const tiltRef = useRef<Group>(null);
+    const liquidRef = useRef<Mesh | null>(null);
+
+    const sloshU = useMemo<SloshUniforms>(
+        () => ({
+            uSlope: { value: new Vector2() },
+            uTop: { value: 1 },
+            uBottom: { value: 0 },
+            uBand: { value: 0.25 },
+            uRipple: { value: 0.012 },
+            uTime: { value: 0 },
+            uGlow: { value: 0.45 },
+        }),
+        []
+    );
+
+    const sim = useRef({
+        slope: new Vector2(),
+        velocity: new Vector2(),
+        previousPosition: new Vector3(),
+        previousLocalVelocity: new Vector2(),
+        previousRotationY: 0,
+        ready: false,
+    });
+
+    const temp = useMemo(
+        () => ({
+            inverseWorldRotation: new Quaternion(),
+            worldUpInLiquidSpace: new Vector3(),
+            liquidWorldPosition: new Vector3(),
+            liquidVelocity: new Vector3(),
+        }),
+        []
+    );
 
     const model = useMemo(() => {
         const clonedScene = scene.clone(true);
-        const capMeshes: Mesh[] = [];
+        const found: { liquid: Mesh | null } = { liquid: null };
 
         clonedScene.traverse((object) => {
-            // Some Blender exports wrap all bottle parts in a parent named
-            // HAYAAH_Bottle and bake a ~28-degree Y rotation into that parent.
-            // That baked rotation survives even when the animated outer group is zero.
-            // The logo is modeled on local +Z, so face the bottle straight toward the +Z camera.
-            if (object.name.toLowerCase() === "hayaah_bottle") {
-                object.rotation.set(0, 0, 0);
-                object.quaternion.identity();
-                object.updateMatrix();
-            }
 
             if (!(object instanceof Mesh)) return;
 
             const meshName = object.name.toLowerCase();
 
-            if (meshName.includes("cap")) capMeshes.push(object);
+            if (meshName.includes("liquid")) {
+                object.geometry.computeBoundingBox();
+                const bounds = object.geometry.boundingBox;
+                if (bounds) {
+                    const liquidHeight = Math.max(bounds.max.y - bounds.min.y, 0.001);
+                    sloshU.uTop.value = bounds.max.y;
+                    sloshU.uBottom.value = bounds.min.y;
+                    // Limit deformation to the upper part of the liquid mesh.
+                    sloshU.uBand.value = Math.max(liquidHeight * 0.32, 0.001);
+                }
+                found.liquid = object;
+            }
 
             const originals = Array.isArray(object.material)
                 ? object.material
                 : [object.material];
 
-            const replaced = originals.map((orig: Material) => {
-                const picked = pickMaterial(meshName, orig);
-                return picked ?? orig.clone();
-            });
+            const replaced = originals.map((orig: Material) =>
+                pickMaterial(meshName, orig, sloshU)
+            );
 
             object.material = Array.isArray(object.material)
                 ? replaced
                 : replaced[0];
-        });
-
-        // Thin gold lines follow the cap's hard bevels, as in the Blender render.
-        // Keep the cap face itself black; don't recolour the entire cap gold.
-        capMeshes.forEach((cap) => {
-            const edgeGeometry = new EdgesGeometry(cap.geometry, 28);
-            const edgeMaterial = new LineBasicMaterial({
-                color: ANTIQUE_GOLD,
-                transparent: true,
-                opacity: 0.88,
-                depthTest: true,
-                depthWrite: false,
-                toneMapped: false,
-            });
-            const edgeLines = new LineSegments(edgeGeometry, edgeMaterial);
-            edgeLines.name = "HAYAAH_Cap_Gold_Edges";
-            edgeLines.scale.setScalar(1.0015);
-            edgeLines.renderOrder = 5;
-            cap.add(edgeLines);
         });
 
         clonedScene.updateMatrixWorld(true);
@@ -204,14 +225,91 @@ function HayaahBottle() {
         const size = bounds.getSize(new Vector3());
         const center = bounds.getCenter(new Vector3());
 
-        const scale = 3 / (size.y || 1);
+        const scale = 3.05 / (size.y || 1);
 
         return {
             scene: clonedScene,
             scale,
             center: center.multiplyScalar(-scale),
+            liquid: found.liquid,
         };
-    }, [scene]);
+    }, [scene, sloshU]);
+
+    useEffect(() => {
+        liquidRef.current = model.liquid;
+    }, [model]);
+
+    // Drive the liquid surface from the same live transforms GSAP applies to the
+    // bottle. Acceleration kicks the liquid; a damped spring then settles it.
+    useFrame((frame, delta) => {
+        const dt = Math.min(delta, 1 / 30);
+        const bottle = bottleRef.current;
+        const tilt = tiltRef.current;
+        const liquid = liquidRef.current;
+        if (!bottle || !tilt || !liquid || dt <= 0) return;
+
+        // Keep the second file's subtle pointer-driven bottle tilt, nested inside
+        // the existing GSAP scroll transform so neither animation overwrites the other.
+        const pointerEase = 1 - Math.exp(-dt * 4);
+        tilt.rotation.x += (-frame.pointer.y * 0.11 - tilt.rotation.x) * pointerEase;
+        tilt.rotation.z += (-frame.pointer.x * 0.09 - tilt.rotation.z) * pointerEase;
+
+        const state = sim.current;
+
+        liquid.updateWorldMatrix(true, false);
+        liquid.getWorldQuaternion(temp.inverseWorldRotation);
+        temp.inverseWorldRotation.invert();
+        temp.worldUpInLiquidSpace
+            .set(0, 1, 0)
+            .applyQuaternion(temp.inverseWorldRotation);
+
+        const upY = Math.max(temp.worldUpInLiquidSpace.y, 0.3);
+        const targetX = Math.max(-0.5, Math.min(0.5, -temp.worldUpInLiquidSpace.x / upY));
+        const targetZ = Math.max(-0.5, Math.min(0.5, -temp.worldUpInLiquidSpace.z / upY));
+
+        liquid.getWorldPosition(temp.liquidWorldPosition);
+        if (!state.ready) {
+            state.previousPosition.copy(temp.liquidWorldPosition);
+            state.previousRotationY = bottle.rotation.y;
+            state.previousLocalVelocity.set(0, 0);
+            state.ready = true;
+        }
+
+        // Convert the liquid mesh's world movement into its local axes. Changes
+        // in that velocity act like inertia when scroll animation speeds up/slows down.
+        temp.liquidVelocity
+            .copy(temp.liquidWorldPosition)
+            .sub(state.previousPosition)
+            .divideScalar(dt)
+            .applyQuaternion(temp.inverseWorldRotation);
+        state.previousPosition.copy(temp.liquidWorldPosition);
+
+        const accelerationX = temp.liquidVelocity.x - state.previousLocalVelocity.x;
+        const accelerationZ = temp.liquidVelocity.z - state.previousLocalVelocity.y;
+        state.previousLocalVelocity.set(temp.liquidVelocity.x, temp.liquidVelocity.z);
+
+        const kick = 1.15;
+        state.velocity.x += Math.max(-3, Math.min(3, -accelerationX * kick));
+        state.velocity.y += Math.max(-3, Math.min(3, -accelerationZ * kick));
+
+        const spin = Math.abs((bottle.rotation.y - state.previousRotationY) / dt);
+        state.previousRotationY = bottle.rotation.y;
+
+        // Damped spring: follows the gravity-level surface, but overshoots slightly.
+        const stiffness = 36;
+        const damping = 3.0;
+        state.velocity.x += (-stiffness * (state.slope.x - targetX) - damping * state.velocity.x) * dt;
+        state.velocity.y += (-stiffness * (state.slope.y - targetZ) - damping * state.velocity.y) * dt;
+        state.slope.x = Math.max(-0.5, Math.min(0.5, state.slope.x + state.velocity.x * dt));
+        state.slope.y = Math.max(-0.5, Math.min(0.5, state.slope.y + state.velocity.y * dt));
+
+        // Keep motion subtle at rest and stronger while the bottle is moving.
+        const speed = Math.hypot(state.velocity.x, state.velocity.y);
+        const rippleTarget = 0.012 + Math.min(0.085, speed * 0.04 + spin * 0.035);
+        sloshU.uRipple.value += (rippleTarget - sloshU.uRipple.value) * (1 - Math.exp(-dt * 5));
+        sloshU.uSlope.value.copy(state.slope);
+        sloshU.uTime.value += dt;
+    });
 
     useEffect(() => {
         const group = bottleRef.current;
@@ -290,15 +388,6 @@ function HayaahBottle() {
     useEffect(() => {
         return () => {
             model.scene.traverse((object) => {
-                if (object instanceof LineSegments) {
-                    object.geometry.dispose();
-                    const lineMaterials = Array.isArray(object.material)
-                        ? object.material
-                        : [object.material];
-                    lineMaterials.forEach((material) => material.dispose());
-                    return;
-                }
-
                 if (!(object instanceof Mesh)) return;
 
                 const materials = Array.isArray(object.material)
@@ -312,8 +401,10 @@ function HayaahBottle() {
 
     return (
         <group ref={bottleRef} position={[0.32, -0.18, 0]} rotation={[0, 0, 0]}>
-            <group scale={model.scale} position={model.center.toArray()}>
-                <primitive object={model.scene} />
+            <group ref={tiltRef}>
+                <group scale={model.scale} position={model.center.toArray()}>
+                    <primitive object={model.scene} />
+                </group>
             </group>
         </group>
     );
